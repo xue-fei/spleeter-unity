@@ -1,5 +1,12 @@
 {
   "dependencies": {
+    "ai.onnxruntime": {
+      "version": "https://github.com/xue-fei/onnxruntime-unity.git",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {},
+      "hash": "4c8fa1c6fdf3f33ba49259a97c78a7b623057633"
+    },
     "com.unity.ext.nunit": {
       "version": "1.0.6",
       "depth": 2,
