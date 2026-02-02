@@ -169,4 +169,24 @@ public struct Complex
     {
         return new Complex(scalar * c.Real, scalar * c.Imag);
     }
+
+    // ✓ 复数乘法 - 最重要！
+    public static Complex operator *(Complex a, Complex b)
+    {
+        float realPart = a.Real * b.Real - a.Imag * b.Imag;
+        float imagPart = a.Real * b.Imag + a.Imag * b.Real;
+        return new Complex(realPart, imagPart);
+    }
+
+    // ✓ 标量乘法（反向）
+    public static Complex operator *(Complex c, float scalar)
+    {
+        return new Complex(c.Real * scalar, c.Imag * scalar);
+    }
+
+    // ✓ 减法
+    public static Complex operator -(Complex a, Complex b)
+    {
+        return new Complex(a.Real - b.Real, a.Imag - b.Imag);
+    }
 }
