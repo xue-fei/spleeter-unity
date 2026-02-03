@@ -15,8 +15,8 @@ public class SeparatorExample : MonoBehaviour
         }
 
         separator = gameObject.AddComponent<AudioSeparator>();
-        string modelPath1 = Application.streamingAssetsPath + "/2stems/vocals.onnx";
-        string modelPath2 = Application.streamingAssetsPath + "/2stems/accompaniment.onnx";
+        string modelPath1 = Application.streamingAssetsPath + "/2stems/vocals.fp16.onnx";
+        string modelPath2 = Application.streamingAssetsPath + "/2stems/accompaniment.fp16.onnx";
 
         Debug.Log("=== 开始初始化分离器 ===");
         Debug.Log($"模型路径1: {modelPath1}");

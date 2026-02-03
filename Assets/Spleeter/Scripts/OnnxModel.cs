@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -21,8 +20,8 @@ public class OnnxModel : IDisposable
             _modelPath = modelPath;
             var sessionOptions = new SessionOptions
             {
-                InterOpNumThreads = 4,
-                IntraOpNumThreads = 4,
+                InterOpNumThreads = 1,
+                IntraOpNumThreads = 1,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL
             };
 
