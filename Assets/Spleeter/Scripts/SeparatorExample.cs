@@ -93,47 +93,60 @@ public class SeparatorExample : MonoBehaviour
         }
 
         Debug.Log("✓ 音频文件存在");
-
-        // 在后台线程执行分离（耗时操作）
-        var separationTask = System.Threading.Tasks.Task.Run(() =>
+        Loom.RunAsync(() =>
         {
-            try
-            {
-                Debug.Log(">> [后台线程] 开始加载音频文件...");
-                var sources = separator.SeparateFromFile(audioPath);
-                Debug.Log($">> [后台线程] 分离完成，获得 {sources.Count} 个音频源");
-
-                return sources;
-            }
-            catch (System.Exception ex)
-            {
-                Debug.LogError($"❌ [后台线程] 分离失败: {ex.Message}\n{ex.StackTrace}");
-                return null;
-            }
-        });
-
-        // 等待后台任务完成
-        while (!separationTask.IsCompleted)
-        {
-            yield return new WaitForSeconds(1f);
-            Debug.Log("⏳ 正在处理音频... (这可能需要几分钟)");
-        }
-
-        if (separationTask.Result != null)
-        {
-            // 回到主线程保存文件
-            try
+            Debug.Log(">> [后台线程] 开始加载音频文件...");
+            var sources = separator.SeparateFromFile(audioPath);
+            Debug.Log($">> [后台线程] 分离完成，获得 {sources.Count} 个音频源");
+            Loom.QueueOnMainThread(() =>
             {
                 Debug.Log("<< [主线程] 开始保存文件");
-                separator.SaveToFile(separationTask.Result, outputDir);
+                Util.SaveToFile(sources, outputDir, 44100);
                 Debug.Log($"✓ 分离完成！文件已保存至: {outputDir}");
-            }
-            catch (System.Exception ex)
-            {
-                Debug.LogError($"❌ [主线程] 保存失败: {ex.Message}\n{ex.StackTrace}");
-            }
-        }
+                isProcessing = false;
+            });
+        });
 
-        isProcessing = false;
+        //// 在后台线程执行分离（耗时操作）
+        //var separationTask = System.Threading.Tasks.Task.Run(() =>
+        //{
+        //    try
+        //    {
+        //        Debug.Log(">> [后台线程] 开始加载音频文件...");
+        //        var sources = separator.SeparateFromFile(audioPath);
+        //        Debug.Log($">> [后台线程] 分离完成，获得 {sources.Count} 个音频源");
+
+        //        return sources;
+        //    }
+        //    catch (System.Exception ex)
+        //    {
+        //        Debug.LogError($"❌ [后台线程] 分离失败: {ex.Message}\n{ex.StackTrace}");
+        //        return null;
+        //    }
+        //});
+
+        //// 等待后台任务完成
+        //while (!separationTask.IsCompleted)
+        //{
+        //    yield return new WaitForSeconds(1f);
+        //    Debug.Log("⏳ 正在处理音频... (这可能需要几分钟)");
+        //}
+
+        //if (separationTask.Result != null)
+        //{
+        //    // 回到主线程保存文件
+        //    try
+        //    {
+        //        Debug.Log("<< [主线程] 开始保存文件");
+        //        Util.SaveToFile(separationTask.Result, outputDir, 44100);
+        //        Debug.Log($"✓ 分离完成！文件已保存至: {outputDir}");
+        //    }
+        //    catch (System.Exception ex)
+        //    {
+        //        Debug.LogError($"❌ [主线程] 保存失败: {ex.Message}\n{ex.StackTrace}");
+        //    }
+        //}
+
+        //isProcessing = false;
     }
 }

@@ -144,7 +144,7 @@ public struct StftResult
     public float[] Imag;
     public int NumFrames;
 }
- 
+
 // 简单的复数类
 public struct Complex
 {
