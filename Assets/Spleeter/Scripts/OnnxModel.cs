@@ -11,13 +11,11 @@ using UnityEngine;
 public class OnnxModel : IDisposable
 {
     private InferenceSession _session;
-    private string _modelPath;
 
     public OnnxModel(string modelPath)
     {
         try
         {
-            _modelPath = modelPath;
             var sessionOptions = new SessionOptions
             {
                 InterOpNumThreads = 1,

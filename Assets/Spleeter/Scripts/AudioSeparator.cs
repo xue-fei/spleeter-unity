@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using MathNet.Numerics;
 using MathNet.Numerics.IntegralTransforms;
 using UnityEngine;
@@ -438,85 +437,13 @@ public class AudioSeparator : MonoBehaviour
     {
         try
         {
-            float[] waveform = LoadWavFile(audioPath);
+            float[] waveform = Util.LoadWavFile(audioPath, ref _sampleRate);
             return Separate(waveform);
         }
         catch (Exception ex)
         {
             Debug.LogError($"文件分离失败: {ex.Message}\n{ex.StackTrace}");
             throw;
-        }
-    }
-
-    private float[] LoadWavFile(string path)
-    {
-        byte[] fileBytes = File.ReadAllBytes(path);
-
-        _sampleRate = BitConverter.ToInt32(fileBytes, 24);
-        int channels = BitConverter.ToInt16(fileBytes, 22);
-        int dataSize = BitConverter.ToInt32(fileBytes, 40);
-
-        int sampleCount = dataSize / (channels * sizeof(short));
-        float[] samples = new float[sampleCount * channels];
-        int dataOffset = 44;
-
-        for (int i = 0; i < sampleCount * channels; i++)
-        {
-            short sample = BitConverter.ToInt16(fileBytes, dataOffset + i * 2);
-            samples[i] = sample / 32768f;
-        }
-
-        return samples;
-    }
-
-    public void SaveToFile(Dictionary<string, float[]> sources, string outputDir)
-    {
-        try
-        {
-            if (!Directory.Exists(outputDir))
-                Directory.CreateDirectory(outputDir);
-
-            foreach (var kvp in sources)
-            {
-                string outputPath = Path.Combine(outputDir, $"{kvp.Key}.wav");
-                SaveWavFile(outputPath, kvp.Value, _sampleRate);
-                Debug.Log($"已保存: {outputPath}");
-            }
-        }
-        catch (Exception ex)
-        {
-            Debug.LogError($"保存失败: {ex.Message}");
-            throw;
-        }
-    }
-
-    private void SaveWavFile(string path, float[] samples, int sampleRate)
-    {
-        int channels = 2;
-        int sampleCount = samples.Length / channels;
-        int byteRate = sampleRate * channels * 2;
-
-        using (var writer = new BinaryWriter(File.Create(path)))
-        {
-            writer.Write(new char[] { 'R', 'I', 'F', 'F' });
-            writer.Write(36 + sampleCount * channels * 2);
-            writer.Write(new char[] { 'W', 'A', 'V', 'E' });
-            writer.Write(new char[] { 'f', 'm', 't', ' ' });
-            writer.Write(16);
-            writer.Write((short)1);
-            writer.Write((short)channels);
-            writer.Write(sampleRate);
-            writer.Write(byteRate);
-            writer.Write((short)(channels * 2));
-            writer.Write((short)16);
-            writer.Write(new char[] { 'd', 'a', 't', 'a' });
-            writer.Write(sampleCount * channels * 2);
-
-            foreach (float sample in samples)
-            {
-                short pcm = (short)Mathf.Clamp(sample * 32767f, -32768, 32767);
-                writer.Write(pcm);
-            }
         }
     }
 
