@@ -5,7 +5,7 @@
       "depth": 0,
       "source": "git",
       "dependencies": {},
-      "hash": "99b49409968ac0bbd9b75efda5a4d6769b87f778"
+      "hash": "bf1d8cf1dd8856e77cd4ba521966e5514a95b103"
     },
     "com.unity.ext.nunit": {
       "version": "1.0.6",
@@ -15,7 +15,7 @@
       "url": "https://packages.unity.cn"
     },
     "com.unity.ide.visualstudio": {
-      "version": "2.0.26",
+      "version": "2.0.27",
       "depth": 0,
       "source": "registry",
       "dependencies": {
