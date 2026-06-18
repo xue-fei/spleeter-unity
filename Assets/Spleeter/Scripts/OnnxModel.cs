@@ -25,10 +25,15 @@ public class OnnxModel : IDisposable
     {
         try
         {
+            // 双模型并行推理时，每个 session 的 IntraOp 线程数应减半，
+            // 避免两个 session 同时各占满 CPU 导致线程超额订阅。
+            // 使用 CUDA 时 CPU 仅处理少量非 CUDA 算子，可进一步降低。
+            int intraThreads = Math.Max(1, Environment.ProcessorCount / 2);
+
             var opts = new SessionOptions
             {
                 InterOpNumThreads = 1,
-                IntraOpNumThreads = Environment.ProcessorCount,
+                IntraOpNumThreads = intraThreads,
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
             };
             opts.AppendExecutionProvider_CUDA(0); // 按需开启
