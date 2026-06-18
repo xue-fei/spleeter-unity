@@ -1,12 +1,5 @@
 {
   "dependencies": {
-    "ai.onnxruntime": {
-      "version": "https://github.com/xue-fei/onnxruntime-unity-cpu.git",
-      "depth": 0,
-      "source": "git",
-      "dependencies": {},
-      "hash": "bf1d8cf1dd8856e77cd4ba521966e5514a95b103"
-    },
     "com.unity.ext.nunit": {
       "version": "1.0.6",
       "depth": 2,
@@ -42,6 +35,22 @@
         "com.unity.modules.ui": "1.0.0",
         "com.unity.modules.imgui": "1.0.0"
       }
+    },
+    "onnxruntime": {
+      "version": "https://github.com/xue-fei/onnxruntime-unity.git",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {},
+      "hash": "0ffce4473c50b3ff39cf915f50cc29c363c49fc7"
+    },
+    "onnxruntime-cuda": {
+      "version": "https://github.com/xue-fei/onnxruntime-unity-cuda.git",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {
+        "onnxruntime": "https://github.com/xue-fei/onnxruntime-unity.git#main"
+      },
+      "hash": "901b7edc4549f6a8d7712495c0c73005d014f243"
     },
     "com.unity.modules.ai": {
       "version": "1.0.0",

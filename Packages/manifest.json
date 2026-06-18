@@ -1,6 +1,7 @@
 {
   "dependencies": {
-    "ai.onnxruntime": "https://github.com/xue-fei/onnxruntime-unity-cpu.git",
+    "onnxruntime": "https://github.com/xue-fei/onnxruntime-unity.git",
+    "onnxruntime-cuda": "https://github.com/xue-fei/onnxruntime-unity-cuda.git",
     "com.unity.ide.visualstudio": "2.0.27",
     "com.unity.ugui": "1.0.0",
     "com.unity.modules.ai": "1.0.0",

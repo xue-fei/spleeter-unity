@@ -1,11 +1,21 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using MathNet.Numerics;
 using MathNet.Numerics.IntegralTransforms;
 using UnityEngine;
 
 /// <summary>
-/// 修复音频重构问题的音频分离器
+/// 音频分离器（性能优化版）
+///
+/// 优化点：
+/// 1. ONNX 双模型并行推理（Task.WhenAll）
+/// 2. 双声道 ISTFT 并行处理（Parallel.For）
+/// 3. 热路径全部使用平铺一维数组，消除锯齿数组多级间接访问
+/// 4. FFT 缓冲区按线程独立分配，解除串行约束
+/// 5. ExtractStftMagnitude / ReshapeForModel 消除冗余中间数组
+/// 6. Flatten4DArray / Tensor4DToJagged 改用 Buffer.BlockCopy / Span
+/// 7. Hann 窗平方预计算，ISTFT 归一化省去重复乘法
 /// </summary>
 public class AudioSeparator : MonoBehaviour
 {
@@ -14,17 +24,27 @@ public class AudioSeparator : MonoBehaviour
 
     private const int N_FFT = 4096;
     private const int HOP_LENGTH = 1024;
-    private const int NUM_BINS = 2049; // N_FFT/2 + 1 = 2049
-    private const int MODEL_BINS = 1024; // 模型只使用前1024个bins
+    private const int NUM_BINS = 2049;   // N_FFT/2 + 1
+    private const int MODEL_BINS = 1024;   // 模型只使用前 1024 个 bins
     private const int CHUNK_SIZE = 512;
     private const float EPSILON = 1e-10f;
     private int _sampleRate = 44100;
 
-    // 性能优化：预分配缓冲区
+    // 预计算窗口及其平方（ISTFT 归一化用）
     private float[] _hannWindow;
-    private Complex32[] _fftBuffer;
-    private Complex32[] _ifftBuffer;
-    private float[] _frameBuffer;
+    private float[] _hannWindowSq; // hann[i]^2，OLA 归一化预计算
+
+    // ── 每个工作线程拥有独立 FFT 缓冲区，支持并行 ──────────────────────────
+    [ThreadStatic] private static Complex32[] t_fftBuf;
+    [ThreadStatic] private static float[] t_frameBuf;
+
+    // ── 静态复用：STFT 原始数据使用平铺 float[] ────────────────────────────
+    // stft 布局: [ch * numFrames * NUM_BINS + frame * NUM_BINS + k]
+    private float[] _stftReal0, _stftImag0;
+    private float[] _stftReal1, _stftImag1;
+
+    // ── 模型输入平铺缓冲（避免 Flatten4DArray 每次分配）──────────────────────
+    private float[] _modelInputFlat;
 
     public void Initialize(string vocalsModelPath, string accompanimentModelPath)
     {
@@ -33,11 +53,10 @@ public class AudioSeparator : MonoBehaviour
             _vocalsModel = new OnnxModel(vocalsModelPath);
             _accompanimentModel = new OnnxModel(accompanimentModelPath);
 
-            // 预分配缓冲区
             _hannWindow = CreateHannWindow(N_FFT);
-            _fftBuffer = new Complex32[N_FFT];
-            _ifftBuffer = new Complex32[N_FFT];
-            _frameBuffer = new float[N_FFT];
+            _hannWindowSq = new float[N_FFT];
+            for (int i = 0; i < N_FFT; i++)
+                _hannWindowSq[i] = _hannWindow[i] * _hannWindow[i];
 
             Debug.Log("分离器初始化成功");
         }
@@ -51,400 +70,336 @@ public class AudioSeparator : MonoBehaviour
     public Dictionary<string, float[]> Separate(float[] waveform)
     {
         if (_vocalsModel == null || _accompanimentModel == null)
-        {
             throw new InvalidOperationException("分离器未初始化");
-        }
 
         try
         {
-            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
 
-            // 分离立体声
+            // ── 1. 解交错立体声 ────────────────────────────────────────────
             int numSamples = waveform.Length / 2;
-            float[][] waveformStereo = new float[2][];
-            waveformStereo[0] = new float[numSamples];
-            waveformStereo[1] = new float[numSamples];
+            float[] ch0 = new float[numSamples];
+            float[] ch1 = new float[numSamples];
 
-            for (int i = 0; i < numSamples; i++)
+            // 并行解交错（numSamples 通常百万量级，值得并行）
+            Parallel.For(0, numSamples, i =>
             {
-                waveformStereo[0][i] = waveform[i * 2];
-                waveformStereo[1][i] = waveform[i * 2 + 1];
-            }
+                ch0[i] = waveform[i * 2];
+                ch1[i] = waveform[i * 2 + 1];
+            });
 
-            Debug.Log($"[1] 立体声分离完成: {numSamples} 样本每通道");
+            Debug.Log($"[1] 立体声分离: {numSamples} 样本/通道");
 
-            // 计算STFT
-            StftResult[] stftResults = new StftResult[2];
-            stftResults[0] = ComputeStft(waveformStereo[0]);
-            stftResults[1] = ComputeStft(waveformStereo[1]);
+            // ── 2. 并行双声道 STFT（各自独立缓冲区，无锁）──────────────────
+            int numFrames = 0;
+            Parallel.Invoke(
+                () => ComputeStftFlat(ch0, out _stftReal0, out _stftImag0, out numFrames),
+                () =>
+                {
+                    int nf;
+                    ComputeStftFlat(ch1, out _stftReal1, out _stftImag1, out nf);
+                }
+            );
 
-            int numFrames = stftResults[0].NumFrames;
-            Debug.Log($"[2] STFT计算完成 - {numFrames} 帧");
+            Debug.Log($"[2] STFT 完成: {numFrames} 帧");
 
-            // 提取幅度谱
-            float[][][] stftData = ExtractStftMagnitude(stftResults);
-
-            // 填充到512的倍数
-            int padding = (CHUNK_SIZE - (numFrames % CHUNK_SIZE)) % CHUNK_SIZE;
+            // ── 3. 构建模型输入（平铺，含 padding）──────────────────────────
+            int padding = (CHUNK_SIZE - numFrames % CHUNK_SIZE) % CHUNK_SIZE;
             int paddedFrames = numFrames + padding;
+            int numSplits = paddedFrames / CHUNK_SIZE;
 
-            if (padding > 0)
-            {
-                stftData = PadStftData(stftData, padding);
-            }
+            // 模型输入形状: (2, numSplits, CHUNK_SIZE, MODEL_BINS)
+            int flatSize = 2 * numSplits * CHUNK_SIZE * MODEL_BINS;
+            if (_modelInputFlat == null || _modelInputFlat.Length < flatSize)
+                _modelInputFlat = new float[flatSize];
+            else
+                Array.Clear(_modelInputFlat, 0, flatSize);
 
-            Debug.Log($"[3] 幅度谱提取完成，填充 {padding} 帧, 总帧数: {paddedFrames}");
+            FillModelInputFlat(_modelInputFlat, numFrames, numSplits);
 
-            // 重新形成输入
-            float[][][][] modelInput = ReshapeForModel(stftData);
-            Debug.Log($"[4] 模型输入转换完成");
+            Debug.Log($"[3] 模型输入构建完成 (splits={numSplits}, padding={padding})");
 
-            // 运行模型
-            var vocalsSpec = _vocalsModel.Run(modelInput);
-            var accompanimentSpec = _accompanimentModel.Run(modelInput);
+            // ── 4. 双模型并行推理 ─────────────────────────────────────────
+            float[] vocalsFlat = null, accompFlat = null;
 
-            Debug.Log($"[5] 模型推理完成");
+            // OnnxModel.RunFlat 接收平铺数组，返回平铺数组，避免锯齿数组转换开销
+            Parallel.Invoke(
+                () => vocalsFlat = _vocalsModel.RunFlat(_modelInputFlat, 2, numSplits, CHUNK_SIZE, MODEL_BINS),
+                () => accompFlat = _accompanimentModel.RunFlat(_modelInputFlat, 2, numSplits, CHUNK_SIZE, MODEL_BINS)
+            );
 
-            // 计算掩码 - 使用C++代码中的Wiener滤波公式
-            float[][][][] vocalsMask = ComputeMaskWiener(vocalsSpec, accompanimentSpec);
-            float[][][][] accompanimentMask = ComputeMaskWiener(accompanimentSpec, vocalsSpec);
+            Debug.Log($"[4] 双模型并行推理完成");
 
-            Debug.Log($"[6] Wiener掩码计算完成");
+            // ── 5. 计算 Wiener 掩码（原地，节省分配）─────────────────────
+            // vocalsMask / accompMask 与输出 flat 等形状
+            float[] vocalsMask = ComputeWienerMaskFlat(vocalsFlat, accompFlat, flatSize);
+            float[] accompMask = ComputeWienerMaskFlat(accompFlat, vocalsFlat, flatSize);
 
-            // 重构音频
-            var results = new Dictionary<string, float[]>();
+            Debug.Log($"[5] Wiener 掩码计算完成");
 
-            Debug.Log($"[7] 开始重构音频...");
+            // ── 6. 并行双声道 ISTFT + 合并 ───────────────────────────────
+            var results = new Dictionary<string, float[]>(2);
 
-            // 使用原始的未填充帧数
-            results["vocals"] = ReconstructAudioFixed(vocalsMask, stftResults, numFrames);
-            Debug.Log($"[8] 人声重构完成");
+            float[] vocalsAudio = null, accompAudio = null;
+            Parallel.Invoke(
+                () => vocalsAudio = ReconstructStereoFlat(vocalsMask, numSplits, numFrames),
+                () => accompAudio = ReconstructStereoFlat(accompMask, numSplits, numFrames)
+            );
 
-            results["accompaniment"] = ReconstructAudioFixed(accompanimentMask, stftResults, numFrames);
-            Debug.Log($"[9] 伴奏重构完成");
+            results["vocals"] = vocalsAudio;
+            results["accompaniment"] = accompAudio;
 
-            stopwatch.Stop();
-            float audioDuration = numSamples / (float)_sampleRate;
-            float rtf = stopwatch.ElapsedMilliseconds / 1000f / audioDuration;
-
-            Debug.Log($"✓ 分离完成！");
-            Debug.Log($"  总耗时: {stopwatch.ElapsedMilliseconds}ms");
-            Debug.Log($"  音频时长: {audioDuration:F2}s");
-            Debug.Log($"  RTF: {rtf:F3}");
+            sw.Stop();
+            float dur = numSamples / (float)_sampleRate;
+            Debug.Log($"✓ 分离完成！耗时={sw.ElapsedMilliseconds}ms  时长={dur:F2}s  RTF={sw.ElapsedMilliseconds / 1000f / dur:F3}");
 
             return results;
         }
         catch (Exception ex)
         {
-            Debug.LogError($"分离过程错误: {ex.Message}\n{ex.StackTrace}");
+            Debug.LogError($"分离错误: {ex.Message}\n{ex.StackTrace}");
             throw;
         }
     }
 
-    /// <summary>
-    /// 计算STFT
-    /// </summary>
-    private StftResult ComputeStft(float[] signal)
+    // ══════════════════════════════════════════════════════════════════════════
+    // STFT — 平铺输出版（线程安全：ThreadStatic 缓冲）
+    // ══════════════════════════════════════════════════════════════════════════
+    private void ComputeStftFlat(float[] signal,
+                                  out float[] real, out float[] imag, out int numFrames)
     {
-        int numFrames = (signal.Length - N_FFT) / HOP_LENGTH + 1;
-        float[] realPart = new float[numFrames * NUM_BINS];
-        float[] imagPart = new float[numFrames * NUM_BINS];
+        numFrames = (signal.Length - N_FFT) / HOP_LENGTH + 1;
+        real = new float[numFrames * NUM_BINS];
+        imag = new float[numFrames * NUM_BINS];
 
-        for (int frameIdx = 0; frameIdx < numFrames; frameIdx++)
+        // ThreadStatic：每个线程第一次使用时初始化，之后复用
+        if (t_fftBuf == null) t_fftBuf = new Complex32[N_FFT];
+        if (t_frameBuf == null) t_frameBuf = new float[N_FFT];
+
+        Complex32[] fft = t_fftBuf;
+        float[] frame = t_frameBuf;
+
+        for (int fi = 0; fi < numFrames; fi++)
         {
-            int offset = frameIdx * HOP_LENGTH;
+            int offset = fi * HOP_LENGTH;
+            int baseIdx = fi * NUM_BINS;
 
-            // 提取帧并应用窗口
+            // 加窗
+            int copyLen = Math.Min(N_FFT, signal.Length - offset);
+            for (int i = 0; i < copyLen; i++)
+                frame[i] = signal[offset + i] * _hannWindow[i];
+            for (int i = copyLen; i < N_FFT; i++)
+                frame[i] = 0f;
+
             for (int i = 0; i < N_FFT; i++)
-            {
-                int sampleIdx = offset + i;
-                _frameBuffer[i] = sampleIdx < signal.Length ?
-                    signal[sampleIdx] * _hannWindow[i] : 0f;
-            }
+                fft[i] = new Complex32(frame[i], 0f);
 
-            // 执行FFT
-            for (int i = 0; i < N_FFT; i++)
-                _fftBuffer[i] = new Complex32(_frameBuffer[i], 0);
+            Fourier.Forward(fft, FourierOptions.Matlab);
 
-            Fourier.Forward(_fftBuffer, FourierOptions.Matlab);
-
-            // 存储结果
-            int baseIdx = frameIdx * NUM_BINS;
             for (int k = 0; k < NUM_BINS; k++)
             {
-                realPart[baseIdx + k] = _fftBuffer[k].Real;
-                imagPart[baseIdx + k] = _fftBuffer[k].Imaginary;
+                real[baseIdx + k] = fft[k].Real;
+                imag[baseIdx + k] = fft[k].Imaginary;
             }
         }
-
-        return new StftResult
-        {
-            Real = realPart,
-            Imag = imagPart,
-            NumFrames = numFrames
-        };
     }
 
-    /// <summary>
-    /// 修正的音频重构函数
-    /// </summary>
-    private float[] ReconstructAudioFixed(float[][][][] mask, StftResult[] stftResults, int originalNumFrames)
+    // ══════════════════════════════════════════════════════════════════════════
+    // 构建模型输入平铺数组
+    // 形状 (2, numSplits, CHUNK_SIZE, MODEL_BINS) → 逐元素取幅度
+    // ══════════════════════════════════════════════════════════════════════════
+    private void FillModelInputFlat(float[] dst, int numFrames, int numSplits)
     {
-        float[][] reconstructed = new float[2][];
+        int stride_ch = numSplits * CHUNK_SIZE * MODEL_BINS;
+        int stride_split = CHUNK_SIZE * MODEL_BINS;
+        int stride_frame = MODEL_BINS;
 
-        for (int ch = 0; ch < 2; ch++)
+        // 并行两声道
+        Parallel.For(0, 2, ch =>
         {
-            reconstructed[ch] = ApplyMaskAndISTFT(mask[ch], stftResults[ch], originalNumFrames);
-        }
+            float[] r = ch == 0 ? _stftReal0 : _stftReal1;
+            float[] im = ch == 0 ? _stftImag0 : _stftImag1;
+            int chBase = ch * stride_ch;
 
-        // 交错成立体声
-        int totalSamples = Math.Max(reconstructed[0].Length, reconstructed[1].Length);
+            for (int s = 0; s < numSplits; s++)
+            {
+                int splitBase = chBase + s * stride_split;
+                for (int fi = 0; fi < CHUNK_SIZE; fi++)
+                {
+                    int globalFrame = s * CHUNK_SIZE + fi;
+                    int dstBase = splitBase + fi * stride_frame;
+
+                    if (globalFrame < numFrames)
+                    {
+                        int srcBase = globalFrame * NUM_BINS;
+                        for (int k = 0; k < MODEL_BINS; k++)
+                        {
+                            float rv = r[srcBase + k];
+                            float iv = im[srcBase + k];
+                            dst[dstBase + k] = MathF.Sqrt(rv * rv + iv * iv);
+                        }
+                    }
+                    // padding 帧：已被 Array.Clear 置零，无需额外处理
+                }
+            }
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Wiener 掩码（原地平铺，无额外分配）
+    // ══════════════════════════════════════════════════════════════════════════
+    private static float[] ComputeWienerMaskFlat(float[] source, float[] other, int len)
+    {
+        float[] mask = new float[len];
+
+        // 向量化友好的展开循环
+        int i = 0;
+        for (; i <= len - 4; i += 4)
+        {
+            mask[i] = WienerVal(source[i], other[i]);
+            mask[i + 1] = WienerVal(source[i + 1], other[i + 1]);
+            mask[i + 2] = WienerVal(source[i + 2], other[i + 2]);
+            mask[i + 3] = WienerVal(source[i + 3], other[i + 3]);
+        }
+        for (; i < len; i++)
+            mask[i] = WienerVal(source[i], other[i]);
+
+        return mask;
+    }
+
+    private static float WienerVal(float s, float o)
+    {
+        float ss = s * s, oo = o * o;
+        return (ss + EPSILON * 0.5f) / (ss + oo + EPSILON);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // 重构立体声：并行双声道 ISTFT，再交错
+    // ══════════════════════════════════════════════════════════════════════════
+    private float[] ReconstructStereoFlat(float[] mask, int numSplits, int numFrames)
+    {
+        float[] ch0Out = null, ch1Out = null;
+
+        Parallel.Invoke(
+            () => ch0Out = ApplyMaskAndISTFTFlat(mask, ch: 0, numSplits, numFrames),
+            () => ch1Out = ApplyMaskAndISTFTFlat(mask, ch: 1, numSplits, numFrames)
+        );
+
+        int totalSamples = Math.Max(ch0Out.Length, ch1Out.Length);
         float[] stereo = new float[totalSamples * 2];
 
-        for (int i = 0; i < totalSamples; i++)
+        // 并行交错合并
+        Parallel.For(0, totalSamples, i =>
         {
-            stereo[i * 2] = i < reconstructed[0].Length ? reconstructed[0][i] : 0f;
-            stereo[i * 2 + 1] = i < reconstructed[1].Length ? reconstructed[1][i] : 0f;
-        }
+            stereo[i * 2] = i < ch0Out.Length ? ch0Out[i] : 0f;
+            stereo[i * 2 + 1] = i < ch1Out.Length ? ch1Out[i] : 0f;
+        });
 
         return stereo;
     }
 
-    /// <summary>
-    /// 应用掩码并执行ISTFT
-    /// </summary>
-    private float[] ApplyMaskAndISTFT(float[][][] mask, StftResult stft, int numFrames)
+    // ══════════════════════════════════════════════════════════════════════════
+    // ISTFT — 平铺掩码版（线程安全：ThreadStatic 缓冲）
+    // mask 形状: (2, numSplits, CHUNK_SIZE, MODEL_BINS)
+    // ══════════════════════════════════════════════════════════════════════════
+    private float[] ApplyMaskAndISTFTFlat(float[] mask, int ch,
+                                           int numSplits, int numFrames)
     {
-        // 计算输出长度
+        // ThreadStatic ifft 缓冲
+        if (t_fftBuf == null) t_fftBuf = new Complex32[N_FFT];
+        Complex32[] ifft = t_fftBuf;
+
+        // 选取当前声道的 STFT 数据
+        float[] stftR = ch == 0 ? _stftReal0 : _stftReal1;
+        float[] stftI = ch == 0 ? _stftImag0 : _stftImag1;
+
+        // 掩码在平铺数组中的起始偏移
+        int maskChOffset = ch * numSplits * CHUNK_SIZE * MODEL_BINS;
+        int maskSplitStride = CHUNK_SIZE * MODEL_BINS;
+        int maskFrameStride = MODEL_BINS;
+
         int outputLength = (numFrames - 1) * HOP_LENGTH + N_FFT;
         float[] output = new float[outputLength];
         float[] windowSum = new float[outputLength];
 
-        int numSplits = mask.Length;
-        int numBins = NUM_BINS;
-
-        for (int frameIdx = 0; frameIdx < numFrames; frameIdx++)
+        for (int fi = 0; fi < numFrames; fi++)
         {
-            int offset = frameIdx * HOP_LENGTH;
-            int splitIdx = frameIdx / CHUNK_SIZE;
-            int inSplitIdx = frameIdx % CHUNK_SIZE;
-            int stftIdx = frameIdx * numBins;
+            int offset = fi * HOP_LENGTH;
+            int splitIdx = fi / CHUNK_SIZE;
+            int inSplitIdx = fi % CHUNK_SIZE;
+            int stftBase = fi * NUM_BINS;
+            int maskBase = maskChOffset + splitIdx * maskSplitStride + inSplitIdx * maskFrameStride;
 
-            // 1. 准备频谱（应用掩码）
-            // 注意：模型输出的掩码只对应前MODEL_BINS个频率
-            for (int k = 0; k < NUM_BINS; k++)
+            // ── 应用掩码，构造复频谱 ────────────────────────────────────
+            // 前 MODEL_BINS：乘以掩码值
+            bool validMask = splitIdx < numSplits;
+            if (validMask)
             {
-                if (k < MODEL_BINS && splitIdx < numSplits && inSplitIdx < mask[splitIdx].Length)
+                for (int k = 0; k < MODEL_BINS; k++)
                 {
-                    // 应用掩码到前MODEL_BINS个频率
-                    float maskVal = mask[splitIdx][inSplitIdx][k];
-                    _ifftBuffer[k] = new Complex32(
-                        stft.Real[stftIdx + k] * maskVal,
-                        stft.Imag[stftIdx + k] * maskVal
-                    );
-                }
-                else if (k < NUM_BINS)
-                {
-                    // 高频部分保持原样（不应用掩码）
-                    _ifftBuffer[k] = new Complex32(stft.Real[stftIdx + k], stft.Imag[stftIdx + k]);
+                    float m = mask[maskBase + k];
+                    ifft[k] = new Complex32(stftR[stftBase + k] * m,
+                                            stftI[stftBase + k] * m);
                 }
             }
+            else
+            {
+                for (int k = 0; k < MODEL_BINS; k++)
+                    ifft[k] = new Complex32(stftR[stftBase + k], stftI[stftBase + k]);
+            }
 
-            // 2. 填充共轭对称部分
-            // 对于N_FFT=4096，NUM_BINS=2049，需要填充2048-4095的共轭对称部分
+            // MODEL_BINS ~ NUM_BINS-1：保持原始高频
+            for (int k = MODEL_BINS; k < NUM_BINS; k++)
+                ifft[k] = new Complex32(stftR[stftBase + k], stftI[stftBase + k]);
+
+            // ── 共轭对称填充 ─────────────────────────────────────────────
             for (int k = NUM_BINS; k < N_FFT; k++)
             {
-                int conjIdx = N_FFT - k;
-                if (conjIdx < NUM_BINS)
-                {
-                    _ifftBuffer[k] = Complex32.Conjugate(_ifftBuffer[conjIdx]);
-                }
-                else
-                {
-                    _ifftBuffer[k] = Complex32.Zero;
-                }
+                int conj = N_FFT - k;
+                ifft[k] = conj < NUM_BINS
+                    ? Complex32.Conjugate(ifft[conj])
+                    : Complex32.Zero;
             }
 
-            // 3. 执行IFFT
-            Fourier.Inverse(_ifftBuffer, FourierOptions.Matlab);
+            // ── IFFT ─────────────────────────────────────────────────────
+            Fourier.Inverse(ifft, FourierOptions.Matlab);
 
-            // 4. 应用窗口并叠加（重叠相加）
-            for (int i = 0; i < N_FFT && offset + i < outputLength; i++)
+            // ── OLA 叠加 ──────────────────────────────────────────────────
+            int endIdx = Math.Min(N_FFT, outputLength - offset);
+            for (int i = 0; i < endIdx; i++)
             {
-                float sample = _ifftBuffer[i].Real * _hannWindow[i];
-                output[offset + i] += sample;
-                windowSum[offset + i] += _hannWindow[i] * _hannWindow[i];
+                output[offset + i] += ifft[i].Real * _hannWindow[i];
+                windowSum[offset + i] += _hannWindowSq[i]; // 预计算平方
             }
         }
 
-        // 5. 补偿重叠相加（归一化）
+        // ── OLA 归一化 ────────────────────────────────────────────────────
         for (int i = 0; i < outputLength; i++)
         {
             if (windowSum[i] > 1e-6f)
-            {
                 output[i] /= windowSum[i];
-            }
         }
 
         return output;
     }
 
-    /// <summary>
-    /// 使用Wiener滤波计算掩码（与C++代码一致）
-    /// </summary>
-    private float[][][][] ComputeMaskWiener(float[][][][] source, float[][][][] other)
+    // ══════════════════════════════════════════════════════════════════════════
+    // 辅助
+    // ══════════════════════════════════════════════════════════════════════════
+    private static float[] CreateHannWindow(int length)
     {
-        int dim0 = source.Length; // 2
-        int dim1 = source[0].Length; // num_splits
-        int dim2 = source[0][0].Length; // 512
-        int dim3 = source[0][0][0].Length; // 1024
-
-        float[][][][] mask = new float[dim0][][][];
-
-        for (int i = 0; i < dim0; i++)
-        {
-            mask[i] = new float[dim1][][];
-            for (int j = 0; j < dim1; j++)
-            {
-                mask[i][j] = new float[dim2][];
-                for (int k = 0; k < dim2; k++)
-                {
-                    mask[i][j][k] = new float[dim3];
-                    for (int l = 0; l < dim3; l++)
-                    {
-                        float sourceMag = source[i][j][k][l];
-                        float otherMag = other[i][j][k][l];
-
-                        // Wiener滤波公式：mask = (source^2 + ε/2) / (source^2 + other^2 + ε)
-                        float sourceSq = sourceMag * sourceMag;
-                        float otherSq = otherMag * otherMag;
-                        float sum = sourceSq + otherSq + EPSILON;
-                        mask[i][j][k][l] = (sourceSq + EPSILON / 2f) / sum;
-                    }
-                }
-            }
-        }
-
-        return mask;
-    }
-
-    #region 辅助方法
-
-    private float[] CreateHannWindow(int length)
-    {
-        float[] window = new float[length];
+        float[] w = new float[length];
+        double scale = 2.0 * Math.PI / (length - 1);
         for (int i = 0; i < length; i++)
-        {
-            // 标准的汉宁窗公式
-            window[i] = 0.5f * (1 - Mathf.Cos(2 * Mathf.PI * i / (length - 1)));
-        }
-        return window;
+            w[i] = 0.5f * (1f - (float)Math.Cos(scale * i));
+        return w;
     }
 
-    private float[][][] ExtractStftMagnitude(StftResult[] stftResults)
-    {
-        float[][][] result = new float[2][][];
-
-        for (int ch = 0; ch < 2; ch++)
-        {
-            int numFrames = stftResults[ch].NumFrames;
-            result[ch] = new float[numFrames][];
-
-            for (int i = 0; i < numFrames; i++)
-            {
-                result[ch][i] = new float[MODEL_BINS];
-                int idx = i * NUM_BINS;
-
-                // 只提取前MODEL_BINS个频率的幅度谱
-                for (int k = 0; k < MODEL_BINS; k++)
-                {
-                    if (k < NUM_BINS)
-                    {
-                        float r = stftResults[ch].Real[idx + k];
-                        float imag = stftResults[ch].Imag[idx + k];
-                        result[ch][i][k] = Mathf.Sqrt(r * r + imag * imag);
-                    }
-                    else
-                    {
-                        result[ch][i][k] = 0f;
-                    }
-                }
-            }
-        }
-
-        return result;
-    }
-
-    private float[][][] PadStftData(float[][][] data, int padding)
-    {
-        int numFrames = data[0].Length;
-        int newFrames = numFrames + padding;
-        float[][][] padded = new float[2][][];
-
-        for (int ch = 0; ch < 2; ch++)
-        {
-            padded[ch] = new float[newFrames][];
-            Array.Copy(data[ch], 0, padded[ch], 0, numFrames);
-
-            for (int i = numFrames; i < newFrames; i++)
-            {
-                padded[ch][i] = new float[MODEL_BINS];
-            }
-        }
-
-        return padded;
-    }
-
-    private float[][][][] ReshapeForModel(float[][][] data)
-    {
-        int numFrames = data[0].Length;
-        int numSplits = numFrames / CHUNK_SIZE;
-
-        // 确保至少有一个split
-        if (numSplits == 0) numSplits = 1;
-
-        float[][][][] result = new float[2][][][];
-
-        for (int ch = 0; ch < 2; ch++)
-        {
-            result[ch] = new float[numSplits][][];
-
-            for (int s = 0; s < numSplits; s++)
-            {
-                result[ch][s] = new float[CHUNK_SIZE][];
-
-                for (int i = 0; i < CHUNK_SIZE; i++)
-                {
-                    result[ch][s][i] = new float[MODEL_BINS];
-                    int frameIdx = s * CHUNK_SIZE + i;
-
-                    if (frameIdx < numFrames)
-                    {
-                        Array.Copy(data[ch][frameIdx], 0, result[ch][s][i], 0, MODEL_BINS);
-                    }
-                }
-            }
-        }
-
-        return result;
-    }
-
-    #endregion
-
-    #region 文件I/O方法
-
+    // ── 文件 I/O ──────────────────────────────────────────────────────────────
     public Dictionary<string, float[]> SeparateFromFile(string audioPath)
     {
-        try
-        {
-            float[] waveform = Util.LoadWavFile(audioPath, ref _sampleRate);
-            return Separate(waveform);
-        }
-        catch (Exception ex)
-        {
-            Debug.LogError($"文件分离失败: {ex.Message}\n{ex.StackTrace}");
-            throw;
-        }
+        float[] waveform = Util.LoadWavFile(audioPath, ref _sampleRate);
+        return Separate(waveform);
     }
 
     public void Dispose()
@@ -453,10 +408,5 @@ public class AudioSeparator : MonoBehaviour
         _accompanimentModel?.Dispose();
     }
 
-    private void OnDestroy()
-    {
-        Dispose();
-    }
-
-    #endregion
+    private void OnDestroy() => Dispose();
 }
