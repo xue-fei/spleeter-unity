@@ -52,11 +52,12 @@ public class OnnxModel : IDisposable
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // RunFlat — 高性能接口
-    // inputFlat 布局: (dim0, dim1, dim2, dim3) 行优先
-    // 返回同形状平铺输出
+    // RunFlatNoCopy — 零拷贝高性能接口（推荐）
+    //
+    // 返回内部 _outputBuf 的引用，省去末尾 Buffer.BlockCopy。
+    // 调用方在下次推理前不得修改返回值，若需要修改请用 RunFlat()。
     // ═══════════════════════════════════════════════════════════════════════
-    public float[] RunFlat(float[] inputFlat, int dim0, int dim1, int dim2, int dim3)
+    public float[] RunFlatNoCopy(float[] inputFlat, int dim0, int dim1, int dim2, int dim3)
     {
         try
         {
@@ -65,8 +66,7 @@ public class OnnxModel : IDisposable
             if (_outputBuf == null || _outputBuf.Length < total)
                 _outputBuf = new float[total];
 
-            // Memory<float> 包装：零拷贝构造 DenseTensor
-            var inputMem = new Memory<float>(inputFlat, 0, total);
+            var inputMem    = new Memory<float>(inputFlat, 0, total);
             var inputTensor = new DenseTensor<float>(inputMem, new[] { dim0, dim1, dim2, dim3 });
 
             var inputs = new List<NamedOnnxValue>
@@ -85,7 +85,6 @@ public class OnnxModel : IDisposable
                 }
                 else
                 {
-                    // 回退路径
                     int idx = 0;
                     for (int i = 0; i < dim0; i++)
                         for (int j = 0; j < dim1; j++)
@@ -95,15 +94,27 @@ public class OnnxModel : IDisposable
                 }
             }
 
-            float[] result = new float[total];
-            Buffer.BlockCopy(_outputBuf, 0, result, 0, total * sizeof(float));
-            return result;
+            // 直接返回内部缓冲引用（无额外拷贝）
+            return _outputBuf;
         }
         catch (Exception ex)
         {
-            Debug.LogError($"RunFlat 推理失败: {ex.Message}");
+            Debug.LogError($"RunFlatNoCopy 推理失败: {ex.Message}");
             throw;
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // RunFlat — 安全接口（返回独立副本，向后兼容）
+    // inputFlat 布局: (dim0, dim1, dim2, dim3) 行优先
+    // ═══════════════════════════════════════════════════════════════════════
+    public float[] RunFlat(float[] inputFlat, int dim0, int dim1, int dim2, int dim3)
+    {
+        float[] noCopy = RunFlatNoCopy(inputFlat, dim0, dim1, dim2, dim3);
+        int     total  = dim0 * dim1 * dim2 * dim3;
+        float[] result = new float[total];
+        Buffer.BlockCopy(noCopy, 0, result, 0, total * sizeof(float));
+        return result;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
